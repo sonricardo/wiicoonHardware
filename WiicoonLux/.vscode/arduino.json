@@ -1,0 +1,5 @@
+{
+    "port": "/dev/cu.usbserial-A5XK3RJT",
+    "board": "espressif:esp32:firebeetle32",
+    "configuration": "FlashFreq=80,UploadSpeed=115200"
+}

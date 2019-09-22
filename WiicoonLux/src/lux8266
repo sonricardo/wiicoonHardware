@@ -1,0 +1,1112 @@
+#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266httpUpdate.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266WiFiScan.h>
+#include <ESP8266WiFiSTA.h>
+#include <ESP8266WiFiAP.h>
+#include <ESP8266WiFi.h>
+#include <ArduinoJson.h>
+#include <ESP8266mDNS.h>
+#include <WiFiServer.h>
+#include <WiFiClient.h>
+#include <TimeLib.h>
+#include <EEPROM.h>
+#include <Time.h>
+ESP8266HTTPUpdateServer httpUpdater;
+ESP8266WebServer server(80);
+String ipServer = "iotcontrol.ddns.net";
+String s_Version = "Lux8266_1.0.ino.bin";
+const char* host = "esp8266-webupdate";
+const int EE_SAVESERV = 0;					// 1 indica que la placa ya fue guardada en el servidor
+const int EE_0 = 1;							// 1 indica primera y unica configuracion
+const int EE_AP = 2;						// 0 desconectado, 1 conectado
+const int EE_STA = 3;						// 0 desconfigurado, 1 configurado
+const int EE_RST = 4;						//	numero de resets de placa
+const int EE_USAP = 5;						// 0 el usuario quiere que no se muestre ap
+const int EE_EF[3] = { 6, 7, 8 };			// estado foco 1
+const int EE_HORASERV = 9;					// 1 indica que la hora ya esta actualizada
+const int EE_IP = 10;						// a 13 guarda ip asignada por el modem		
+const int EE_UPDATE = 15;					// 1 indica que debe buscar actualizacion 
+const int EE_SERVER = 16;					// 1 indica que quieres que se conecte al servidor
+const int EE_HORALOCAL = 17;				// 1 indica que la hora local esta programada
+const int EE_SSID = 20;						// a 49 guarda el valor de ssid sta
+const int EE_PASS = 50;						// a 79 guarda el valor de pass sta
+const int EE_FPASS = 79;					// final de pass
+const int EE_ALARM = 80;					// inicio de alarmas
+const int EE_ALARF = 790;					// final de alarma
+const int EE_TIME = 800;
+const int EE_2000 = 2000;
+const int TIME_SERVER_SAVE = 3;				// tiempo de preguntar al servidor
+const int TIME_SERVER_RECONECT = 120;		// tiempo de preguntar al servidor si se desconecta
+const int FOCOS[3] = { 15, 12, 13 };
+const int APAGADORES[3] = { 14, 4, 5 };
+int i_Marcadores[3];
+int i_Estados[3] = { LOW, LOW, LOW };
+uint64_t timeServer = 0;
+boolean b_ServF[3];							// bandera de activacion de focos
+int i_ScanRed;								// obtiene el numero de redes encontradas		
+boolean b_banFocoServer;					// se activa cuando hay un movimiento en el apagador
+boolean b_banServer = false;				// false indica que se esta comunicando con el servidor
+int i_hora, i_minuto, i_segundo, i_dia, i_mes, i_ano, i_min;
+int i_Serial;
+//debounce variables
+const int TOKENS_FOR_CHANGE_STATE = 5;
+int i_TokensDeb[3] = { 0, 0, 0 };
+IPAddress nullIP(0, 0, 0, 0);
+void inicializar()
+{
+	if (EEPROM.read(EE_0) != 1)				// valores iniciales de eeprom
+	{
+		EEPROM.write(EE_0, 1);
+		EEPROM.write(EE_RST, 0);
+		EEPROM.write(EE_EF[0], 0);
+		EEPROM.write(EE_EF[1], 0);
+		EEPROM.write(EE_EF[2], 0);
+		EEPROM.write(EE_USAP, 1);
+		EEPROM.write(EE_HORASERV, 0);
+		EEPROM.write(EE_HORALOCAL, 0);
+		EEPROM.write(EE_SERVER, 0);
+		EEPROM.write(EE_TIME, 1);
+		EEPROM.write(EE_TIME + 1, 0);
+		EEPROM.write(EE_TIME + 2, 0);
+		EEPROM.write(EE_TIME + 3, 1);
+		EEPROM.write(EE_TIME + 4, 1);
+		EEPROM.write(EE_TIME + 5, 18);
+		EEPROM.commit();
+	}
+	for (int i = 0; i < 3; i++)				// valores iniciales de focos
+	{
+		pinMode(FOCOS[i], OUTPUT);
+		pinMode(APAGADORES[i], INPUT);
+		i_Marcadores[i] = digitalRead(APAGADORES[i]);
+		focoAccion(i + 1, EEPROM.read(EE_EF[i]), true);
+	}
+	WiFi.mode(WIFI_AP_STA);
+	configAP(1);
+	EEPROM.write(EE_RST, (EEPROM.read(EE_RST) + 1));
+	EEPROM.write(EE_HORASERV, 0);
+	EEPROM.commit();
+	if (EEPROM.read(EE_STA) == 1)
+	{
+		String s_Ssid = lee(EE_SSID);
+		String s_Pass = lee(EE_PASS);
+		wifiScanConfig(s_Ssid, s_Pass);
+	}
+	MDNS.begin(host);
+	httpUpdater.setup(&server);
+	server.begin();
+	MDNS.addService("http", "tcp", 80);
+	Serial.printf("HTTPUpdateServer ready! Open http://%s.local/update in your browser\n", host);
+	if (EEPROM.read(EE_SERVER) == 1)
+		Serv_getHora();
+	if (EEPROM.read(EE_SERVER) == 0 && EEPROM.read(EE_HORALOCAL) == 1) 
+		timeProvicional();
+}
+void apConfig()
+{
+	entregaDatos();
+	String s_GetVal = server.arg("estado");
+	int i_GetVal = s_GetVal.toInt();
+	if (i_GetVal == 0)
+		EEPROM.write(EE_USAP, 0);
+	else
+		EEPROM.write(EE_USAP, 1);
+	EEPROM.commit();
+	configAP(i_GetVal);
+}
+void configAP(int i)
+{
+	if (i == 1)
+	{
+		if (EEPROM.read(EE_AP) != 1)
+		{
+			Serial.println(); Serial.println();
+			Serial.println("Inicia_ AP");
+			char c_ApSsid[14], c_ApPass[8];
+			int i_ApSsid = 0, i_ApPass = 0;
+			String s_ApSsid = "Wiicoon_";
+			s_ApSsid = s_ApSsid + WiFi.softAPmacAddress()[9]
+				+ WiFi.softAPmacAddress()[10]
+				+ WiFi.softAPmacAddress()[12]
+				+ WiFi.softAPmacAddress()[13]
+				+ WiFi.softAPmacAddress()[15]
+				+ WiFi.softAPmacAddress()[16];
+			i_ApSsid = s_ApSsid.length() + 1;
+			s_ApSsid.toCharArray(c_ApSsid, i_ApSsid);
+			String s_ApPass = getApPass(WiFi.softAPmacAddress());
+			i_ApPass = s_ApPass.length() + 1;
+			s_ApPass.toCharArray(c_ApPass, i_ApPass);
+			WiFi.softAP(c_ApSsid, c_ApPass);
+			EEPROM.write(EE_AP, 1);						// 1 indica AP activado, 0 AP desactivado 
+		}
+	}
+	else
+	{
+		if (EEPROM.read(EE_AP) == 1 && WiFi.status() == WL_CONNECTED)
+		{
+			Serial.println(); Serial.println();
+			Serial.println("Termina_ AP");
+			WiFi.softAPdisconnect(true);
+			EEPROM.write(EE_AP, 0);						//1 indica AP activado, 0 AP desactivado 
+		}
+	}
+	EEPROM.commit();
+}
+String getApPass(String s_macAddress)
+{
+	String s_pass = "";
+	int i_indice;
+	char c_caracteres[4];
+	i_indice = s_macAddress.lastIndexOf(":");
+	c_caracteres[0] = s_macAddress.charAt(i_indice - 2);
+	c_caracteres[1] = s_macAddress.charAt(i_indice - 1);
+	c_caracteres[2] = s_macAddress.charAt(i_indice + 1);
+	c_caracteres[3] = s_macAddress.charAt(i_indice + 2);
+	for (int i = 0; i < 4; i++)
+	{
+		switch (c_caracteres[i])
+		{
+		case '0': s_pass = s_pass + "00"; break;
+		case '1': s_pass = s_pass + "01"; break;
+		case '2': s_pass = s_pass + "02"; break;
+		case '3': s_pass = s_pass + "03"; break;
+		case '4': s_pass = s_pass + "04"; break;
+		case '5': s_pass = s_pass + "05"; break;
+		case '6': s_pass = s_pass + "06"; break;
+		case '7': s_pass = s_pass + "07"; break;
+		case '8': s_pass = s_pass + "08"; break;
+		case '9': s_pass = s_pass + "09"; break;
+		case 'A': s_pass = s_pass + "10"; break;
+		case 'B': s_pass = s_pass + "11"; break;
+		case 'C': s_pass = s_pass + "12"; break;
+		case 'D': s_pass = s_pass + "13"; break;
+		case 'E': s_pass = s_pass + "14"; break;
+		case 'F': s_pass = s_pass + "15"; break;
+		default:
+			break;
+		}
+	}
+	return s_pass;
+}
+void staData()
+{
+	entregaDatos();
+	Serial.println(); Serial.println();
+	Serial.println("Get data STA");
+	String s_GetSsid = server.arg("ssid");
+	String s_GetPass = server.arg("pass");
+	if ((WiFi.status() == WL_CONNECTED && s_GetSsid.equals(WiFi.SSID().c_str()) && s_GetPass.equals(WiFi.psk().c_str())) || s_GetSsid == NULL)
+	{
+		Serial.println("Sigue conectado a la red");
+		Serial.println(WiFi.localIP());
+	}
+	else{
+		for (int i = EE_SSID; i <= EE_FPASS; i++)
+			EEPROM.write(i, 255);
+		EEPROM.write(EE_STA, 0);
+		EEPROM.commit();
+		staConnect(s_GetSsid, s_GetPass, true);
+	}
+}
+void wifiScanConfig(String s_ssid, String s_pass)
+{
+	WiFi.scanDelete();
+	WiFi.disconnect();
+	int i_Scan = WiFi.scanNetworks();
+	//String WifiSSid;
+	if (i_Scan != 0)
+	{
+		for (int i = 0; i < i_Scan; i++)
+		{
+			if (s_ssid.equals(WiFi.SSID(i).c_str()))
+			{
+				//WiFi.reconnect();
+				staConnect(s_ssid, s_pass, false);
+				break;
+			}
+		}
+	}
+}
+void staConnect(String s_ssid, String s_pass, boolean b_staData)
+{
+	char c_Ssid[30], c_Pass[30];
+	int i_ssid = s_ssid.length() + 1;
+	int i_pass = s_pass.length() + 1;
+	s_ssid.toCharArray(c_Ssid, i_ssid);
+	s_pass.toCharArray(c_Pass, i_pass);
+	boolean b_band = false;
+	int i_cont = 0;
+	Serial.print("SSID = ");
+	Serial.println(c_Ssid);
+	Serial.print("PASS = ");
+	Serial.println(c_Pass);
+	WiFi.begin(c_Ssid, c_Pass);
+	while (WiFi.status() != WL_CONNECTED)
+	{
+		delay(500);
+		if (WiFi.status() == WL_NO_SSID_AVAIL)
+		{
+			Serial.println("No encuentra la red SSID");
+			b_band = true;
+			break;
+		}
+		if (WiFi.status() == WL_CONNECT_FAILED)
+		{
+			Serial.println("Pass incorrecto");
+			for (int i = EE_SSID; i <= EE_FPASS; i++)
+				EEPROM.write(i, 255);
+			EEPROM.write(EE_STA, 0);
+			EEPROM.commit();
+			b_band = true;
+			break;
+		}
+		Serial.print(".");
+		i_cont++;
+		if (i_cont >30)
+		{
+			Serial.println("Se agoto el tiempo de espera");
+			b_band = true;
+			break;
+		}
+	}
+	if (b_band == false)
+	{
+		//WiFi.softAPdisconnect(true);
+		WiFi.mode(WIFI_AP_STA);
+		entregaDatos();
+		Serial.println("Ya se conecto a la red!!!");
+		if (EEPROM.read(EE_STA) != 1)
+		{
+			EEPROM.write(EE_STA, 1);
+			graba(EE_SSID, s_ssid);				//Graba en eeprom ssid
+			graba(EE_PASS, s_pass);				//Graba en eeprom pass
+		}
+	}
+	else
+	{
+		Serial.println("no se conecto");
+		WiFi.disconnect();
+		if (b_staData == true)
+		{
+			EEPROM.write(EE_STA, 0);
+			for (int i = EE_SSID; i <= EE_FPASS; i++)
+				EEPROM.write(i, 255);
+			EEPROM.commit();
+		}
+	}
+}
+void focoControl()
+{
+	Serial.println(); Serial.println();
+	Serial.println("foco_control");
+	String s_FocoEst = server.arg("estado");
+	String s_FocoId = server.arg("foco");
+	int i_FocoEst = s_FocoEst.toInt();
+	int i_FocoId = s_FocoId.toInt();
+	focoAccion(i_FocoId, i_FocoEst, true);
+}
+void focoApagador()
+{
+	for (int i = 0; i < 3; i++)
+	{
+		if (i_Marcadores[i] != digitalRead(APAGADORES[i]))
+		{
+			if (i_TokensDeb[i] >= TOKENS_FOR_CHANGE_STATE) {
+				i_Marcadores[i] = !i_Marcadores[i];
+				i_Estados[i] = !i_Estados[i];
+				focoAccion(i + 1, i_Estados[i], true);
+				i_TokensDeb[i] = 0;
+			}
+			i_TokensDeb[i]++;
+		}
+	}
+}
+void focoAccion(int i_focoId, int i_focoEst, boolean b_serv)
+{
+	int i_foco = i_focoId - 1;
+	EEPROM.write(EE_EF[i_foco], i_focoEst);
+	EEPROM.commit();
+	i_Estados[i_foco] = i_focoEst;
+	b_ServF[i_foco] = true;
+	digitalWrite(FOCOS[i_foco], i_focoEst);
+	if (b_serv)
+		b_banFocoServer = true;
+	entregaDatos();
+}
+void alarmaConfig()
+{
+	int bandera = 0;
+	int i_Id = 0, l, i_AlId;
+	int i_AlFoco, i_AlEstado, i_AlRep;
+	String s_Gethora = server.arg("hora");
+	String s_Getmin = server.arg("min");
+	String s_Getdia = server.arg("dia");
+	String s_Getfoco = server.arg("foco");
+	String s_Getestado = server.arg("estado");
+	String s_Getrep = server.arg("rep");
+	i_dia = s_Getdia.toInt();
+	i_hora = s_Gethora.toInt();
+	i_minuto = s_Getmin.toInt();
+	i_AlFoco = s_Getfoco.toInt();
+	i_AlEstado = s_Getestado.toInt();
+	i_AlRep = s_Getrep.toInt();
+	for (int i = EE_ALARM; i <= EE_ALARF; i = i + 10)
+	{
+		i_Id++;
+		l = i;
+		if (EEPROM.read(l) != 255 && EEPROM.read(++l) == i_dia && EEPROM.read(++l) == i_hora && EEPROM.read(++l) == i_minuto && EEPROM.read(++l) == i_AlFoco && EEPROM.read(++l) == i_AlEstado && EEPROM.read(++l) == i_AlRep)
+		{
+			i_AlId = EEPROM.read(l);
+			bandera = 1;
+		}
+		if (EEPROM.read(i) == 255 && bandera == 0)
+		{
+			i_AlId = i_Id;
+			l = i;
+			EEPROM.write(l, i_Id);			// 100.- se guarda el id de la alarma
+			EEPROM.write(++l, i_dia);		// 101.- se guarda el dia de la semana en que se activa la alarma L, M...
+			EEPROM.write(++l, i_hora);		// 102.- se guarda hora de la alarma
+			EEPROM.write(++l, i_minuto);	// 103.- se guarda el minuto de la alarma
+			EEPROM.write(++l, i_AlFoco);	// 104.- se guarda la salida del foco que se va a controlar
+			EEPROM.write(++l, i_AlEstado);	// 105.- se guarda el estado del foco
+			EEPROM.write(++l, i_AlRep);		// 106.- se guarda 1 si la alarma solo se activa una vez 
+			EEPROM.commit();
+			bandera = 1;
+		}
+	}
+	StaticJsonBuffer<100> jsonBuffer;
+	JsonObject& root = jsonBuffer.createObject();
+	String s_ApMacAddress = WiFi.softAPmacAddress();
+	String s_IpLocal = String(WiFi.localIP()[0]) + "."
+		+ String(WiFi.localIP()[1]) + "."
+		+ String(WiFi.localIP()[2]) + "."
+		+ String(WiFi.localIP()[3]);
+	root["macAddress"] = s_ApMacAddress;
+	root["id"] = i_AlId;
+	String s_myString;
+	root.prettyPrintTo(s_myString);
+	server.send(200, "application/json", s_myString);
+}
+void alarma(int i_Hour, int i_Minute, int i_Day, int i_Anio)
+{
+	int i_Foco, i_Estado, l;
+	Serial.println("Entro a activar alarma");
+	if (i_Anio != 1970)
+	{
+		for (int i = EE_ALARM; i <= EE_ALARF; i = i + 10)
+		{
+			l = i;														//0
+			if (EEPROM.read(i) != 255)
+			{
+				l++;													//1
+				if (bitRead(EEPROM.read(l), i_Day) != 0)
+				{
+
+					if (EEPROM.read(++l) == i_Hour)						//2
+					{
+						if (EEPROM.read(++l) == i_Minute)				//3
+						{
+							i_Foco = EEPROM.read(++l);					//4			
+							i_Estado = EEPROM.read(++l);				//5			
+							focoAccion(i_Foco, i_Estado, true);
+							if (EEPROM.read(++l) == 1)					//6
+							{
+								for (int j = 0; j <= 9; j++)
+									EEPROM.write(i + j, 255);
+								EEPROM.commit();
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+void alarmaBorrar(){
+	entregaDatos();
+	int i_id;
+	String s_GetID = server.arg("id");
+	i_id = s_GetID.toInt();
+	for (int i = EE_ALARM; i <= EE_ALARF; i = i + 10)
+	{
+		if (EEPROM.read(i) == i_id)
+		{
+			for (int j = 0; j <= 9; j++)
+				EEPROM.write(i + j, 255);
+			EEPROM.commit();
+		}
+	}
+}
+void getAlarma()
+{
+	Serial.println(); Serial.println();
+	Serial.println("Entrega_Alarmas");
+	int l = 0;
+	StaticJsonBuffer<2000> jsonBuffer;
+	JsonObject& root = jsonBuffer.createObject();
+	String s_ApMacAddress = WiFi.softAPmacAddress();
+	String s_IpLocal = String(WiFi.localIP()[0]) + "."
+		+ String(WiFi.localIP()[1]) + "."
+		+ String(WiFi.localIP()[2]) + "."
+		+ String(WiFi.localIP()[3]);
+	root["macAddress"] = s_ApMacAddress;
+	JsonArray& alarmas = root.createNestedArray("alarmas");
+	for (int i = EE_ALARM; i <= EE_ALARF; i = i + 10)
+	{
+		if (EEPROM.read(i) != 255)
+		{
+			l = i;
+			JsonObject& alarma = alarmas.createNestedObject();
+			alarma["id"] = EEPROM.read(l);
+			alarma["dia"] = EEPROM.read(++l);
+			alarma["hora"] = EEPROM.read(++l);
+			alarma["min"] = EEPROM.read(++l);
+			alarma["foco"] = EEPROM.read(++l);
+			alarma["estado"] = EEPROM.read(++l);
+			alarma["rep"] = EEPROM.read(++l);
+		}
+	}
+	String s_myString;
+	root.prettyPrintTo(s_myString);
+	server.send(200, "application/json", s_myString);
+	server.requestAuthentication();
+}
+void entregaDatos()
+{
+	Serial.println(); Serial.println();
+	Serial.println("Entrega_datos");
+	StaticJsonBuffer<500> jsonBuffer;
+	JsonObject& root = jsonBuffer.createObject();
+	String s_ApMacAddress = WiFi.softAPmacAddress();
+	String s_IpLocal = String(WiFi.localIP()[0]) + "."
+		+ String(WiFi.localIP()[1]) + "."
+		+ String(WiFi.localIP()[2]) + "."
+		+ String(WiFi.localIP()[3]);
+	root["macAddress"] = s_ApMacAddress;
+	root["version"] = s_Version;
+	if (WiFi.isConnected() == true)
+		root["ipAddress"] = s_IpLocal;
+	root["Reset"] = EEPROM.read(EE_RST);
+	root["numSalidas"] = 3;
+	JsonArray& focos = root.createNestedArray("focos");
+	for (int i = 0; i < 3; i++)
+	{
+		JsonObject& foco = focos.createNestedObject();
+		foco["estado"] = i_Estados[i];
+		foco["numDeSalida"] = i + 1;
+	}
+	String s_myString;
+	root.prettyPrintTo(s_myString);
+	server.send(200, "application/json", s_myString);
+}
+void scanRedes()
+{
+	//entregaDatos();
+	Serial.println(); Serial.println();
+	Serial.println("Escanear_Redes");
+	WiFi.scanDelete();
+	WiFi.disconnect();
+	i_ScanRed = WiFi.scanNetworks();
+	getRedes();
+}
+void getRedes()
+{
+	Serial.println(); Serial.println();
+	Serial.println("Entrega_Redes");
+	StaticJsonBuffer<2000> jsonBuffer;
+	JsonObject& root = jsonBuffer.createObject();
+	JsonArray& redes = root.createNestedArray("redes");
+	if (i_ScanRed != 0)
+	{
+		for (int i = 0; i < i_ScanRed; i++)
+		{
+			JsonObject& red = redes.createNestedObject();
+			red["SSID"] = WiFi.SSID(i);
+			red["RSSI"] = WiFi.RSSI(i);
+			Serial.println(WiFi.SSID(i));
+			Serial.println(WiFi.RSSI(i));
+		}
+	}
+	String s_myString;
+	root.prettyPrintTo(s_myString);
+	server.send(200, "application/json", s_myString);
+	server.requestAuthentication();
+}
+void printData(){
+	entregaDatos();
+	Serial.println(); Serial.println();
+	Serial.println("Datos generales");
+	Serial.print("Direccion MAC: ");
+	Serial.println(WiFi.softAPmacAddress());
+	Serial.print("Direccion IP: ");
+	Serial.println(WiFi.localIP());
+	Serial.print("Version: ");
+	Serial.println(s_Version);
+	Serial.print("Reset 1: ");
+	Serial.println(EEPROM.read(EE_RST));
+	time_t t = now();
+	Serial.print("Dia de la semana: ");
+	Serial.println(weekday(t));
+	Serial.println("Fecha y Hora: ");
+	Serial.print(day(t));
+	Serial.print(+"/");
+	Serial.print(month(t));
+	Serial.print(+"/");
+	Serial.print(year(t));
+	Serial.print(" ");
+	Serial.print(hour(t));
+	Serial.print(+":");
+	Serial.print(minute(t));
+	Serial.print(":");
+	Serial.println(second(t));
+	Serial.print("foco 1: ");
+	Serial.println(EEPROM.read(EE_EF[0]));
+	Serial.print("foco 2: ");
+	Serial.println(EEPROM.read(EE_EF[1]));
+	Serial.print("foco 3: ");
+	Serial.println(EEPROM.read(EE_EF[2]));
+	Serial.print("Estado de la red: ");
+	if (WiFi.isConnected() == true)
+		Serial.println("Conectado");
+	else
+		Serial.println("Desconectado");
+}
+void graba(int i_addr, String s_a)
+{
+	int i_tam = (s_a.length() + 1);
+	char c_graba[30];
+	s_a.toCharArray(c_graba, i_tam);
+	EEPROM.write(i_addr, i_tam);
+	for (int j = 0; j < i_tam; j++)
+	{
+		i_addr++;
+		EEPROM.write(i_addr, c_graba[j]);
+	}
+	EEPROM.commit();
+}
+String lee(int addr) {
+	String nuevoString;
+	int valor;
+	int tamano = EEPROM.read(addr);
+	for (int i = 0; i < tamano; i++) {
+		addr++;
+		valor = EEPROM.read(addr);
+		nuevoString += (char) valor;
+	}
+	return nuevoString;
+}
+void leeprom()
+{
+	entregaDatos();
+	for (int i = 0; i < 1024; i++)
+	{
+		if (EEPROM.read(i) != 255)
+		{
+			Serial.print(i);
+			Serial.print(" ");
+			Serial.println(EEPROM.read(i));
+		}
+	}
+}
+void limpiaEeprom()
+{
+	entregaDatos();
+	Serial.println("Limpia eeprom se va a resetear la placa");
+	configAP(0);
+	WiFi.disconnect();
+	for (int i = 2; i <= 799; i++)
+		EEPROM.write(i, 255);
+	EEPROM.commit();
+	ESP.reset();
+}
+void formatear()
+{
+	entregaDatos();
+	Serial.println("Formatear se va a resetear la placa");
+	configAP(0);
+	WiFi.disconnect();
+	for (int i = 0; i <= 1024; i++)
+		EEPROM.write(i, 255);
+	EEPROM.commit();
+	ESP.reset();
+}
+void timeConfig()
+{
+	entregaDatos();
+	String s_Gethora = server.arg("hora");
+	String s_Getmin = server.arg("min");
+	String s_Getseg = server.arg("seg");
+	String s_Getdia = server.arg("dia");
+	String s_Getmes = server.arg("mes");
+	String s_Getano = server.arg("ano");
+	i_hora = s_Gethora.toInt();
+	i_minuto = s_Getmin.toInt();
+	i_segundo = s_Getseg.toInt();
+	i_dia = s_Getdia.toInt();
+	i_mes = s_Getmes.toInt();
+	i_ano = s_Getano.toInt();
+	setTime(i_hora, i_minuto, i_segundo, i_dia, i_mes, i_ano);
+	time_t t = now();
+	if (EEPROM.read(EE_SERVER) == 0)
+	{
+		EEPROM.write(EE_HORALOCAL, 1);
+		EEPROM.commit();
+		respaldarDatos(minute(t), hour(t), day(t), month(t), year(t));
+	}
+}
+void timeProvicional()
+{
+	int i_indice = EEPROM.read(EE_TIME) + EE_TIME;
+	i_segundo = 0;
+	setTime(EEPROM.read(i_indice + 1), EEPROM.read(i_indice + 0),
+		i_segundo, EEPROM.read(i_indice + 2), EEPROM.read(i_indice + 3),
+		(EEPROM.read(i_indice + 4) + EE_2000));
+	time_t t = now();
+}
+void respaldarDatos(int i_m, int i_h, int i_d, int i_M, int i_a)
+{
+	int i_indice = EEPROM.read(EE_TIME) + EE_TIME;
+	int Mes = i_indice + 3;
+	i_a = i_a - EE_2000;
+	if (i_M != EEPROM.read(Mes))		// 1003 Mes
+	{
+		for (int i = 0; i <= 8; i++)
+			EEPROM.write(i_indice + i, 255);
+		int sumIndice = EEPROM.read(EE_TIME) + 1;
+		EEPROM.write(EE_TIME, sumIndice);
+		i_indice = sumIndice + EE_TIME;
+	}
+	if (i_m != EEPROM.read(i_indice))			//1000 Minuto
+		EEPROM.write(i_indice, i_m);
+	if (i_h != EEPROM.read(i_indice + 1))		//1001 Hora
+		EEPROM.write(i_indice + 1, i_h);
+	if (i_d != EEPROM.read(i_indice + 2))		//1002 Dia
+		EEPROM.write(i_indice + 2, i_d);
+	if (i_M != EEPROM.read(i_indice + 3))		//1003 Mes
+		EEPROM.write(i_indice + 3, i_M);
+	if (i_a != EEPROM.read(i_indice + 4))		//1004 A?o
+		EEPROM.write(i_indice + 4, i_a);
+	EEPROM.commit();
+}
+void Serv_data_info(){									//pregunta al servidor nuevos estados para axionar en placa
+	if (WiFi.status() == WL_CONNECTED) {
+		Serial.println("Serv_data_info");
+		HTTPClient http;
+		String s_ApMacAddress = WiFi.softAPmacAddress();
+		http.begin("http://" + ipServer + "/app/data_info?mac=" + s_ApMacAddress);
+		int httpCode = http.GET();
+
+		if (httpCode > 0) {
+			String datos = http.getString();
+			const size_t bufferSize = 600;
+			DynamicJsonBuffer jsonBuffer(bufferSize);
+			JsonObject& root = jsonBuffer.parseObject(datos);
+
+			int ok = root["ok"];
+			if (ok == 2){
+				EEPROM.write(EE_SAVESERV, 0);
+				EEPROM.commit();
+				Serv_savePlaca();
+				b_banServer = false;
+			}
+			else{
+				b_banServer = false;
+				int update = root["httpUpdate"];
+				int numFocos = root["focos"].size();
+				if (update == 1)
+				{
+					EEPROM.write(EE_UPDATE, 1);
+					EEPROM.commit();
+				}
+				for (int i = 0; i < numFocos; i++){
+					int numFoco = root["focos"][i]["numDeSalida"];
+					int estado = root["focos"][i]["estado"];
+					if (EEPROM.read(EE_EF[numFoco - 1]) != estado)
+					{
+						focoAccion(numFoco, estado, false);
+					}
+				}
+			}
+		}
+		http.end();
+	}
+}
+void Serv_test()
+{
+	if (WiFi.status() == WL_CONNECTED) {
+		Serial.println("Serv_test");
+		HTTPClient http;
+		String s_ApMacAddress = WiFi.softAPmacAddress();
+		http.begin("http://" + ipServer + "/app/serv_test?mac=" + s_ApMacAddress);
+		int httpCode = http.GET();
+
+		if (httpCode > 0) {
+			String datos = http.getString();
+			const size_t bufferSize = 600;
+			DynamicJsonBuffer jsonBuffer(bufferSize);
+			JsonObject& root = jsonBuffer.parseObject(datos);
+
+			int ok = root["ok"];
+			if (ok == 1)
+				b_banServer = false;
+			if (ok == 2){
+				EEPROM.write(EE_SAVESERV, 0);
+				EEPROM.commit();
+				Serv_savePlaca();
+				b_banServer = false;
+			}
+		}
+		http.end();
+	}
+}
+void Serv_savePlaca(){
+	if ((EEPROM.read(EE_SAVESERV) == 0 || EEPROM.read(EE_SAVESERV) == 255))
+	{
+		if (WiFi.status() == WL_CONNECTED) {
+			Serial.println("Serv_savePlaca");
+			HTTPClient http;
+			String s_ApMacAddress = WiFi.softAPmacAddress();
+			String s_IpLocal = String(WiFi.localIP()[0]) + "."
+				+ String(WiFi.localIP()[1]) + "."
+				+ String(WiFi.localIP()[2]) + "."
+				+ String(WiFi.localIP()[3]);
+			http.begin("http://" + ipServer + "/app/savePlaca?mac=" + s_ApMacAddress +
+				"&ip=" + s_IpLocal + "&salidas=" + 3);
+			int httpCode = http.GET();
+
+			if (httpCode > 0) {
+				Serial.println(httpCode);
+				String datos = http.getString();
+				const size_t bufferSize = 50;
+				DynamicJsonBuffer jsonBuffer(bufferSize);
+				JsonObject& root = jsonBuffer.parseObject(datos);
+				Serial.print(datos);
+				int ok = root["ok"];
+				if (ok == 1){
+					Serial.print("Placa Guardada");
+					EEPROM.write(EE_SAVESERV, 1);
+					EEPROM.write(EE_IP, 1);
+					EEPROM.write(EE_IP + 1, WiFi.localIP()[0]);
+					EEPROM.write(EE_IP + 2, WiFi.localIP()[1]);
+					EEPROM.write(EE_IP + 3, WiFi.localIP()[2]);
+					EEPROM.write(EE_IP + 4, WiFi.localIP()[3]);
+					EEPROM.commit();
+				}
+			}
+			http.end();
+		}
+	}
+}
+void Serv_updateIp(){
+	if (EEPROM.read(EE_IP) == 1)
+	{
+		if (EEPROM.read(EE_IP + 1) != WiFi.localIP()[0] || EEPROM.read(EE_IP + 2) != WiFi.localIP()[1] ||
+			EEPROM.read(EE_IP + 3) != WiFi.localIP()[2] || EEPROM.read(EE_IP + 4) != WiFi.localIP()[3])
+		{
+			EEPROM.write(EE_IP, 0);
+			EEPROM.commit();
+			Serial.println("cambio la ip");
+		}
+	}
+	if (EEPROM.read(EE_IP) == 0 || EEPROM.read(EE_IP) == 255)
+	{
+		Serial.println("Serv_updateIp");
+		if (EEPROM.read(EE_IP) == 1)
+		{
+			EEPROM.write(EE_IP, 0);
+			EEPROM.commit();
+		}
+		if (WiFi.status() == WL_CONNECTED) {
+			HTTPClient http;
+			String s_ApMacAddress = WiFi.softAPmacAddress();
+			String s_IpLocal = String(WiFi.localIP()[0]) + "."
+				+ String(WiFi.localIP()[1]) + "."
+				+ String(WiFi.localIP()[2]) + "."
+				+ String(WiFi.localIP()[3]);
+			http.begin("http://" + ipServer + "/app/updateIp?mac=" + s_ApMacAddress + "&ip=" + s_IpLocal);
+			int httpCode = http.GET();
+
+			if (httpCode > 0) {
+				Serial.println(httpCode);
+				String datos = http.getString();
+				const size_t bufferSize = 50;
+				DynamicJsonBuffer jsonBuffer(bufferSize);
+				JsonObject& root = jsonBuffer.parseObject(datos);
+				Serial.print(datos);
+				int ok = root["ok"];
+				if (ok == 1){
+					EEPROM.write(EE_IP, 1);
+					EEPROM.write(EE_IP + 1, WiFi.localIP()[0]);
+					EEPROM.write(EE_IP + 2, WiFi.localIP()[1]);
+					EEPROM.write(EE_IP + 3, WiFi.localIP()[2]);
+					EEPROM.write(EE_IP + 4, WiFi.localIP()[3]);
+					EEPROM.commit();
+				}
+			}
+			http.end();
+		}
+	}
+}
+void Serv_getHora(){
+	if ((EEPROM.read(EE_HORASERV) == 0 || EEPROM.read(EE_HORASERV) == 255))
+	{
+		if (WiFi.status() == WL_CONNECTED) {
+			Serial.println("Serv_getHora");
+			HTTPClient http;
+			String s_ApMacAddress = WiFi.softAPmacAddress();
+			http.begin("http://" + ipServer + "/app/getHora");
+			int httpCode = http.GET();
+
+			if (httpCode > 0) {
+				Serial.println(httpCode);
+				String datos = http.getString();
+				const size_t bufferSize = 100;
+				DynamicJsonBuffer jsonBuffer(bufferSize);
+				JsonObject& root = jsonBuffer.parseObject(datos);
+				Serial.print(datos);
+				i_hora = root["hora"];
+				i_minuto = root["min"];
+				i_segundo = root["seg"];
+				i_dia = root["dia"];
+				i_mes = root["mes"];
+				i_mes++;
+				i_ano = root["year"];
+				setTime(i_hora, i_minuto, i_segundo, i_dia, i_mes, i_ano);
+				time_t t = now();
+				EEPROM.write(EE_HORASERV, 1);
+				EEPROM.commit();
+			}
+			http.end();
+		}
+	}
+}
+void Serv_foco_control(int foco, int estado){				//guarda en el servidor el cambio de estado
+	if (WiFi.status() == WL_CONNECTED) {
+		Serial.println("Serv_foco_control");
+		HTTPClient http;
+		String s_ApMacAddress = WiFi.softAPmacAddress();
+		http.begin("http://" + ipServer + "/app/foco_control?mac=" + s_ApMacAddress +
+			"&foco=" + foco + "&estado=" + estado);
+		int httpCode = http.GET();
+
+		if (httpCode > 0) {
+			Serial.println(httpCode);
+			String datos = http.getString();
+			const size_t bufferSize = 50;
+			DynamicJsonBuffer jsonBuffer(bufferSize);
+			JsonObject& root = jsonBuffer.parseObject(datos);
+			Serial.print(datos);
+			int ok = root["ok"];
+			if (ok == 1){
+				b_banFocoServer = false;
+				b_banServer = false;
+				foco--;
+				b_ServF[foco] = false;
+				Serial.print("salida: ");
+				Serial.println(foco);
+			}
+			if (ok == 2)
+			{
+				EEPROM.write(EE_SAVESERV, 0);
+				EEPROM.commit();
+				Serv_savePlaca();
+				b_banServer = false;
+			}
+		}
+		http.end();
+	}
+}
+void Serv_version(){
+	if (WiFi.status() == WL_CONNECTED) {
+		Serial.println("Serv_version");
+		HTTPClient http;
+		String s_ApMacAddress = WiFi.softAPmacAddress();
+		http.begin("http://" + ipServer + "/app/consulta_version?vers=" + s_Version);
+		int httpCode = http.GET();
+
+		if (httpCode > 0) {
+			Serial.println(httpCode);
+			String datos = http.getString();
+			const size_t bufferSize = 600;
+			DynamicJsonBuffer jsonBuffer(bufferSize);
+			JsonObject& root = jsonBuffer.parseObject(datos);
+			String server_version = root["version"];
+			if (s_Version != server_version)
+				httpUpdate(server_version);
+			else {
+				Serial.println("sin cambios");
+				EEPROM.write(EE_UPDATE, 0);
+				EEPROM.commit();
+			}
+		}
+		http.end();
+	}
+}
+void Serv_on(){
+	EEPROM.write(EE_SERVER, 1);
+	EEPROM.commit();
+}
+void Serv_off(){
+	EEPROM.write(EE_SERVER, 0);
+	EEPROM.commit();
+}
+void httpUpdate(String s_version)
+{
+	entregaDatos();
+	if (b_banServer == false)
+	{
+		Serial.println("vamos a intentarlo....");
+		String s_url = "http://" + ipServer + "/app/descargar?id=" + s_version;
+		Serial.println(s_url);
+		t_httpUpdate_return ret = ESPhttpUpdate.update(s_url);
+		//t_httpUpdate_return  ret = ESPhttpUpdate.update("https://server/file.bin");
+
+		switch (ret) {
+		case HTTP_UPDATE_FAILED:
+			Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+			break;
+
+		case HTTP_UPDATE_NO_UPDATES:
+			Serial.println("HTTP_UPDATE_NO_UPDATES");
+			break;
+
+		case HTTP_UPDATE_OK:
+			Serial.println("HTTP_UPDATE_OK");
+			break;
+		}
+	}
+}
+void ota_httpUpdate()
+{
+	entregaDatos();
+	if (b_banServer == false)
+	{
+		Serial.println("vamos a intentarlo....");
+		String s_Bin = server.arg("binario");
+		String s_url = "http://" + ipServer + "/app/descargar?id=" + s_Bin;
+		Serial.println(s_url);
+		t_httpUpdate_return ret = ESPhttpUpdate.update(s_url);
+		//t_httpUpdate_return  ret = ESPhttpUpdate.update("https://server/file.bin");
+
+		switch (ret) {
+		case HTTP_UPDATE_FAILED:
+			Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+			break;
+
+		case HTTP_UPDATE_NO_UPDATES:
+			Serial.println("HTTP_UPDATE_NO_UPDATES");
+			break;
+
+		case HTTP_UPDATE_OK:
+			Serial.println("HTTP_UPDATE_OK");
+			break;
+		}
+	}
+}
+void consulta_server(){
+	if (b_banFocoServer == true)
+	{
+		for (int i = 0; i < 3; i++)
+			if (b_ServF[i])
+				Serv_foco_control(i + 1, i_Estados[i]);
+	}
+	else  Serv_data_info();
+}
+void setup()
+{
+	Serial.begin(115200);
+	EEPROM.begin(1024);
+	inicializar();
+	server.on("/config", staData);
+	server.on("/leeprom", leeprom);
+	server.on("/server_on", Serv_on);
+	server.on("/server_off", Serv_off);
+	server.on("/ap_config", apConfig);
+	server.on("/get_redes", getRedes);
+	server.on("/get_alarma", getAlarma);
+	server.on("/scan_redes", scanRedes);
+	server.on("/binario", ota_httpUpdate);
+	server.on("/data_info", entregaDatos);
+	server.on("/time_config", timeConfig);
+	server.on("/data_reset", limpiaEeprom);
+	server.on("/foco_control", focoControl);
+	server.on("/formatearPlaca", formatear);
+	server.on("/alarma_config", alarmaConfig);
+	server.on("/alarma_borrar", alarmaBorrar);
+}
+void loop()
+{
+	time_t t = now();
+	server.handleClient();
+	focoApagador();
+	if (i_min != minute(t))
+	{
+		Serial.println("entrada por minuto");
+		i_min = minute(t);
+		alarma(hour(t), minute(t), weekday(t), year(t));
+		if (EEPROM.read(EE_SERVER) == 0 && EEPROM.read(EE_HORALOCAL) == 1)
+			respaldarDatos(minute(t), hour(t), day(t), month(t), year(t));
+		if (WiFi.status() != WL_CONNECTED && EEPROM.read(EE_STA) == 1)
+		{
+			if (EEPROM.read(EE_AP) == 0)
+				configAP(1);
+			if (WiFi.getAutoConnect() == true)
+				WiFi.setAutoConnect(true);
+			String s_Ssid = lee(EE_SSID);
+			String s_Pass = lee(EE_PASS);
+			wifiScanConfig(s_Ssid, s_Pass);
+		}
+		printData();
+		if (EEPROM.read(EE_USAP) == 0 && WiFi.softAPgetStationNum() == 0 && WiFi.status() == WL_CONNECTED)
+			configAP(0);
+		if (WiFi.status() == WL_CONNECTED && b_banServer == false && EEPROM.read(EE_SERVER) == 1)
+		{
+			Serv_savePlaca();
+			Serv_updateIp();
+			Serv_getHora();
+			if (EEPROM.read(EE_UPDATE) == 1){
+				Serv_version();
+			}
+		}
+	}
+	if (WiFi.status() == WL_CONNECTED && EEPROM.read(EE_SERVER) == 1)
+	{
+		if (t - timeServer >= TIME_SERVER_SAVE && b_banServer == false)
+		{
+			Serial.println("cada 3 seg");
+			b_banServer = true;
+			consulta_server();
+			timeServer = t;
+		}
+		if (t - timeServer >= TIME_SERVER_RECONECT && b_banServer == true)
+		{
+			Serial.println("cada 2 min");
+			timeServer = t;
+			Serv_test();
+		}
+	}
+	if (Serial.available() > 0){
+		i_Serial = Serial.read();
+		if (i_Serial == 'r')
+			scanRedes();
+		if (i_Serial == 'f')
+			formatear();
+		if (i_Serial == 'p')
+			printData();
+		if (i_Serial == 'e')
+			leeprom();
+		if (i_Serial == 'z')
+			focoAccion(1, 0, true);
+		if (i_Serial == 'x')
+			focoAccion(2, 0, true);
+		if (i_Serial == 'c')
+			focoAccion(3, 0, true);
+		if (i_Serial == 'a')
+			focoAccion(1, 1, true);
+		if (i_Serial == 's')
+			focoAccion(2, 1, true);
+		if (i_Serial == 'd')
+			focoAccion(3, 1, true);
+	}
+}

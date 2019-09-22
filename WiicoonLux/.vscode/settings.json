@@ -1,0 +1,7 @@
+{
+    "terminal.integrated.env.osx": {
+        "PATH": "/Users/ingfernando/.platformio/penv/bin:/Users/ingfernando/.platformio/penv:/Library/Frameworks/Python.framework/Versions/2.7/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Frameworks/Mono.framework/Versions/Current/Commands",
+        "PLATFORMIO_CALLER": "vscode"
+    },
+    "C_Cpp.intelliSenseEngineFallback": "Disabled"
+}
